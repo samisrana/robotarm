@@ -2,8 +2,12 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import csv
 import time
+import matplotlib.pyplot as plt
 from Arm_Lib import Arm_Device
 
+Arm = Arm_Device()
+
+# Define necessary functions...
 def rotx(theta):
     return R.from_euler('x', theta, degrees=True).as_matrix()
 
@@ -62,79 +66,81 @@ def rotm2euler(R):
 def wrap_to_180(angles):
     return ((angles + 180) % 360) - 180
 
+# Function to move the specified joint to a given angle
 def moveJoint(jnum, ang, speedtime):
-    """
-    Move the specified joint to the given position.
-    """
     Arm.Arm_serial_servo_write(jnum, ang, speedtime)
     return
 
+def readAllActualJointAngles(Arm):
+    # Retrieve joint angles, replacing None values with 0.0 if they occur
+    q = [Arm.Arm_serial_servo_read(jnum) for jnum in range(1, 6)]
+    return np.array([angle if angle is not None else 0.0 for angle in q])
+
+# Generate the path and move the robot accordingly
+def move_robot_sequence(qstart, qend, N=250):
+    lambda_vals = np.linspace(0, 1, N)
+    q_path = np.zeros((5, N))  # Store calculated joint angles
+    Tstart = time.time()
+    Qmeasure = []  # Measured joint angles
+    T = []  # Timestamps
+
+    # Generate the path
+    for ii in range(N):
+        q_path[:, ii] = (1 - lambda_vals[ii]) * qstart + lambda_vals[ii] * qend
+
+    # Move to initial joint configuration (first point)
+    initial_angles = q_path[:, 0]
+    for jnum, angle in enumerate(initial_angles):
+        moveJoint(jnum + 1, angle, 800)
+    time.sleep(2)  # Allow time for reaching initial position
+
+    # Log initial measurement and time
+    Qmeasure.append(readAllActualJointAngles(Arm))
+    T.append(time.time() - Tstart)
+
+    # Move through the generated path
+    for idx, qdesired in enumerate(q_path.T[1:], start=1):  # Skip the first point
+        for jnum, angle in enumerate(qdesired):
+            moveJoint(jnum + 1, angle, 200)  # Set movement speed
+        time.sleep(0.01)  # Small delay between movements
+
+        # Log measured angles and time for each step
+        Qmeasure.append(readAllActualJointAngles(Arm))
+        T.append(time.time() - Tstart)
+
+    return q_path, Qmeasure, T, lambda_vals
+
 if __name__ == "__main__":
-    # Initialize the robot arm
-    Arm = Arm_Device()
-    time.sleep(2)  # Wait for initialization
-    
-    try:
-        # Define start and end configurations
-        qstart = np.array([150., 45., 45., 45., 90.])
-        qend = np.array([90., 45., -30., 20., 10.])
+    # Define start and end configurations
+    qstart = np.array([90., 90., 90., 90., 90.])
+    qend = np.array([0., 210., -10., 120., 0.])
+    N = 250  # Number of path points
+
+    # Execute movement and capture data
+    q_path, Qmeasure, T, lambda_vals = move_robot_sequence(qstart, qend, N)
+    Qmeasure = np.array(Qmeasure).T  # Transpose for plotting
+
+    # Save data to CSV
+    with open('combined_data.csv', mode='w', newline='') as output:
+        writer = csv.writer(output)
+        writer.writerow(['', 'λ', 'qdesired(λ)', 'q(λ)', 'Timestamp'])
         
-        N = 250
-        lambda_vals = np.linspace(0, 1, N)
-        
-        # Pre-allocate arrays
-        q = np.zeros((5, N))
-        Rot = np.zeros((3, 3, N))
-        eulerot = np.zeros((3, N))
-        Pot = np.zeros((3, N))
-        qset = []
-        
-        # Generate path
-        for ii in range(N):
-            q[:, ii] = (1 - lambda_vals[ii]) * qstart + lambda_vals[ii] * qend
-            Rot[:, :, ii], Pot[:, ii] = fwdkin_Dofbot(q[:, ii])
-            eulerot[:, ii] = wrap_to_180(rotm2euler(Rot[:, :, ii]) * 180 / np.pi)
-        
-        # Write to CSV
-        with open('data.csv', mode='w', newline='') as output:
-            writer = csv.writer(output)
-            writer.writerow(['', 'λ', 'qdesired(λ)', 'q(λ)'])
-            
-            for i in range(N):
-                qdesired = (1 - lambda_vals[i]) * qstart + lambda_vals[i] * qend
-                qactual = q[:, i]
-                
-                qdesired_str = f"[{', '.join([str(round(x)) for x in qdesired])}]"
-                qactual_str = f"[{', '.join([str(round(x)) for x in qactual])}]"
-                
-                writer.writerow([i+1, round(lambda_vals[i], 3), qdesired_str, qactual_str])
-        
-        print("Data written to data.csv")
-        print("Starting robot movement...")
-        
-        # Read and execute the path
-        with open('data.csv', 'r') as file:
-            csv_reader = csv.reader(file)
-            next(csv_reader)  # Skip header
-            
-            for row in csv_reader:
-                # Parse the desired angles
-                q_str = row[2].strip('[]').split(',')
-                angles = [int(float(q)) for q in q_str]
-                
-                # Move each joint
-                for jnum in range(5):
-                    moveJoint(jnum + 1, angles[jnum], 500)  # 500ms movement time
-                
-                time.sleep(1)  # Wait between configurations
-        
-        print("Path execution completed!")
-        
-    except KeyboardInterrupt:
-        print("\nProgram stopped by user")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
-        # Release servos when done
-        Arm.release_all_servos()
-        print("Servos released")
+        for i, (timestamp, measured_angles, qdesired) in enumerate(zip(T, Qmeasure.T, q_path.T)):
+            qdesired_str = f"[{', '.join([str(round(x)) for x in qdesired])}]"
+            # Handle None values in measured angles by replacing with "0.0" if they occur
+            measured_str = f"[{', '.join([str(round(x, 2)) if x is not None else '0.0' for x in measured_angles])}]"
+            writer.writerow([i + 1, round(lambda_vals[i], 3), qdesired_str, measured_str, round(timestamp, 3)])
+
+    print("Data saved to combined_data.csv")
+
+    # Plot measured vs calculated angles for each joint
+    for joint in range(5):
+        plt.figure(figsize=(10, 6))
+        plt.plot(lambda_vals, q_path[joint, :], label=f'Joint {joint + 1} Calculated Angle')
+        plt.plot(lambda_vals, Qmeasure[joint, :], label=f'Joint {joint + 1} Measured Angle', linestyle='--')
+        plt.xlabel("Lambda (Path Progress)")
+        plt.ylabel("Angle (degrees)")
+        plt.title(f"Measured vs Calculated Angles for Joint {joint + 1}")
+        plt.legend()
+        plt.grid()
+        plt.show()
